@@ -4,8 +4,15 @@ import { Archive, Search, Plus, Users, Globe2, Sparkles, Settings2, ChevronRight
 import './styles.css';
 import './theme.css';
 
-const API = '/api';
-async function request(path, options) { const res = await fetch(API + path, { headers: { 'Content-Type': 'application/json' }, ...options }); if (!res.ok) { const body = await res.json().catch(() => ({})); throw new Error(body.error || 'No se pudo guardar.'); } return res.status === 204 ? null : res.json(); }
+const API_BASE = import.meta.env.VITE_API_URL?.replace(/\/+$/, '') || '';
+async function request(path, options) {
+ if (import.meta.env.PROD && !API_BASE) throw new Error('El frontend está publicado, pero falta conectar el backend Express. GitHub Pages solo sirve archivos estáticos; configura VITE_API_URL para habilitar los datos.');
+ let res;
+ try { res = await fetch(`${API_BASE}/api${path}`, { headers: { 'Content-Type': 'application/json' }, ...options }); }
+ catch { throw new Error('No se pudo conectar con la API. Revisá el servidor y VITE_API_URL.'); }
+ if (!res.ok) { const body = await res.json().catch(() => ({})); throw new Error(body.error || `La API respondió ${res.status}.`); }
+ return res.status === 204 ? null : res.json();
+}
 const blankCharacter = { universe_id: '', name: '', alias: '', pronouns: '', gender: '', species: '', origin: '', residence: '', occupation: '', status: '', powers: '', tags: '', description: '', biography: '' };
 const blankUniverse = { name: '', description: '', genre: '', tone: '', color: '#c2a878' };
 
