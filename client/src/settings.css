@@ -1,0 +1,2 @@
+.settings-form{display:grid;gap:11px;margin-top:14px}.settings-form label,.danger-zone>label{display:grid;gap:6px;font-size:10px;color:var(--muted)}.settings-form textarea,.danger-zone input{width:100%}.settings-form button{justify-self:start}.danger-zone{border-color:#74473d}.danger-zone .eyebrow{color:#c6816b}.danger-button{margin-top:12px;border:1px solid #8f4d3d;background:#5b2b22;color:#f1d9d1;padding:9px 12px;border-radius:3px;font-size:10px}.danger-zone>small{display:block;color:var(--muted);font-size:9px;margin-top:13px}
+

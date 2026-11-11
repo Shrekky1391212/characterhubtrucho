@@ -4,8 +4,8 @@
   "type": "module",
   "engines": { "node": ">=22.13.0" },
   "scripts": {
-    "dev": "node --watch src/index.js",
-    "start": "node src/index.js",
+    "dev": "node --watch src/app.js",
+    "start": "node src/app.js",
     "migrate:sqlite": "node src/migrate-sqlite.js"
   },
   "dependencies": { "cors": "^2.8.5", "express": "^4.21.2", "pg": "^8.23.1", "zod": "^4.6.7" }
