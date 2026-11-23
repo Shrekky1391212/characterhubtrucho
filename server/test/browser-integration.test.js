@@ -236,6 +236,15 @@ test('Edge browser exercises login, 503 fallback, library, groups, memberships, 
     await fillPlaceholder('Descripción o comentario','Retrato de viaje','.sheet-image-add');
     await clickButton('Agregar imagen');
     await waitFor(async () => (await db.query('SELECT count(*)::int AS count FROM media_assets WHERE owner_id=$1 AND character_id=$2',[universe.data.owner_id,character.data.id])).rows[0]?.count===1,'character gallery image persistence');
+    await clickButton('Habilidades y poderes');
+    await waitFor(() => cdp.evaluate("document.querySelector('.sheet-detail h2')?.textContent==='Habilidades y poderes'"),'individual abilities section');
+    await fillLabel('Nombre','Starlight pulse','.ability-manager');
+    await fillLabel('Descripción','A focused burst of astral energy.','.ability-manager');
+    await clickButton('Crear y vincular');
+    await waitFor(async () => (await db.query("SELECT details->'character_sheet'->'abilities' AS abilities FROM characters WHERE id=$1",[character.data.id])).rows[0]?.abilities?.some(item=>item.mastery===''&&item.ability_entry_id),'shared ability entry linked to its character sheet');
+    await fillLabel('Dominio','Practiced','.ability-manager');
+    await clickButton('Guardar datos de este personaje');
+    await waitFor(async () => (await db.query("SELECT details->'character_sheet'->'abilities' AS abilities FROM characters WHERE id=$1",[character.data.id])).rows[0]?.abilities?.some(item=>item.mastery==='Practiced'),'individual ability mastery persisted');
     await clickButton('Cerrar ficha');
     await clickButton('Biblioteca');
     await fillLabel('Scope', 'global', '.phase2-filters');

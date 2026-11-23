@@ -9,6 +9,7 @@ import { initializeDatabase, pool as defaultPool } from './db.js';
 import { canReparentNode, normalizeContentScope, sameContentScope } from './world-structure.js';
 import { createPhase2Router } from './phase2-router.js';
 import { validateLocationLinkReferences } from './character-location-links.js';
+import { validateCharacterAbilityLinks } from './character-ability-links.js';
 
 export function createApp({ databasePool = defaultPool } = {}) {
 const pool = databasePool;
@@ -535,6 +536,8 @@ app.post('/api/characters', asyncRoute(async (req, res) => {
   if (!(await ownedNode(req.user.id, scope.universe_id, scope.universe_node_id))) return res.status(400).json({ error: 'El nivel no pertenece al universo elegido.' });
   const locationError = await validateLocationLinkReferences(pool, req.user.id, scope, d.details?.location_links);
   if (locationError) return res.status(400).json({ error: locationError, details: { fieldErrors: { 'details.location_links': [locationError] } } });
+  const abilityError = await validateCharacterAbilityLinks(pool, req.user.id, scope, d.details);
+  if (abilityError) return res.status(400).json({ error: abilityError, details: { fieldErrors: { 'details.character_sheet.abilities': [abilityError] } } });
   const result = await pool.query(
     `WITH inserted AS (
        INSERT INTO characters (owner_id, scope_kind, universe_id, universe_node_id, name, alias, pronouns, gender, species, origin, residence, occupation, status, powers, tags, description, biography, details)
@@ -554,8 +557,13 @@ app.put('/api/characters/:id', asyncRoute(async (req, res) => {
   if (!scope) return res.status(400).json({ error: 'Elegí un universo, o marcá el elemento como pendiente o global.' });
   if (!(await ownedUniverse(req.user.id, scope.universe_id))) return res.status(400).json({ error: 'El universo no existe en tu archivo.' });
   if (!(await ownedNode(req.user.id, scope.universe_id, scope.universe_node_id))) return res.status(400).json({ error: 'El nivel no pertenece al universo elegido.' });
-  const locationError = await validateLocationLinkReferences(pool, req.user.id, scope, d.details?.location_links);
+  const current=await pool.query('SELECT details FROM characters WHERE id=$1 AND owner_id=$2',[req.params.id,req.user.id]);
+  if(!current.rowCount)return res.status(404).json({error:'Personaje no encontrado.'});
+  const resultingDetails=d.details??current.rows[0].details;
+  const locationError = await validateLocationLinkReferences(pool, req.user.id, scope, resultingDetails?.location_links);
   if (locationError) return res.status(400).json({ error: locationError, details: { fieldErrors: { 'details.location_links': [locationError] } } });
+  const abilityError = await validateCharacterAbilityLinks(pool, req.user.id, scope, resultingDetails);
+  if (abilityError) return res.status(400).json({ error: abilityError, details: { fieldErrors: { 'details.character_sheet.abilities': [abilityError] } } });
   const result = await pool.query(
     `WITH updated AS (
        UPDATE characters SET scope_kind=$1, universe_id=$2, universe_node_id=$3, name=$4, alias=$5, pronouns=$6, gender=$7, species=$8, origin=$9,
@@ -616,7 +624,6 @@ app.post('/api/entries', asyncRoute(async (req, res) => {
   if (d.parent_id) {
     const parent = await entityScope(req.user.id, 'entry', d.parent_id);
     if (!sameContentScope(parent, scope)) return res.status(400).json({ error: 'El elemento superior debe tener el mismo alcance.' });
-    if (await entryParentWouldCycle(req.user.id,req.params.id,d.parent_id)) return res.status(400).json({error:'La jerarquía produciría un ciclo.'});
   }
   const result = await pool.query(
     `INSERT INTO archive_entries (owner_id, scope_kind, universe_id, universe_node_id, parent_id, kind, name, description, tags, data)
@@ -636,6 +643,7 @@ app.put('/api/entries/:id', asyncRoute(async (req, res) => {
   if (d.parent_id) {
     const parent = await entityScope(req.user.id, 'entry', d.parent_id);
     if (!sameContentScope(parent, scope)) return res.status(400).json({ error: 'El elemento superior debe tener el mismo alcance.' });
+    if (await entryParentWouldCycle(req.user.id,req.params.id,d.parent_id)) return res.status(400).json({error:'La jerarquía produciría un ciclo.'});
   }
   const result = await pool.query(
     `UPDATE archive_entries SET scope_kind=$1, universe_id=$2, universe_node_id=$3, parent_id=$4, kind=$5, name=$6, description=$7, tags=$8, data=COALESCE($9::jsonb,data), updated_at=CURRENT_TIMESTAMP
@@ -664,13 +672,40 @@ app.get('/api/entries/:id/links', asyncRoute(async (req, res) => {
       JOIN archive_entries s ON s.id=l.source_entry_id AND s.owner_id=l.owner_id
      LEFT JOIN archive_entries t ON t.id=l.target_entry_id AND t.owner_id=l.owner_id
      LEFT JOIN characters c ON c.id=l.target_character_id AND c.owner_id=l.owner_id
+      JOIN archive_entries current_entry ON current_entry.id=$2 AND current_entry.owner_id=l.owner_id
       WHERE l.owner_id=$1 AND (l.source_entry_id=$2 OR l.target_entry_id=$2)
-        AND ((l.target_entry_id IS NOT NULL AND (t.scope_kind,t.universe_id) IS NOT DISTINCT FROM (s.scope_kind,s.universe_id))
-          OR (l.target_character_id IS NOT NULL AND (c.scope_kind,c.universe_id) IS NOT DISTINCT FROM (s.scope_kind,s.universe_id)))
-        AND ((l.source_entry_id=$2 AND ((t.id IS NOT NULL AND (t.scope_kind,t.universe_id) IS NOT DISTINCT FROM (s.scope_kind,s.universe_id)) OR (c.id IS NOT NULL AND (c.scope_kind,c.universe_id) IS NOT DISTINCT FROM (s.scope_kind,s.universe_id))))
-          OR (l.target_entry_id=$2 AND (s.scope_kind,s.universe_id) IS NOT DISTINCT FROM ((SELECT e.scope_kind,e.universe_id FROM archive_entries e WHERE e.id=$2 AND e.owner_id=$1))))
+        AND ((l.source_entry_id=$2 AND ((t.id IS NOT NULL AND (t.scope_kind,t.universe_id) IS NOT DISTINCT FROM (current_entry.scope_kind,current_entry.universe_id)) OR (c.id IS NOT NULL AND (c.scope_kind,c.universe_id) IS NOT DISTINCT FROM (current_entry.scope_kind,current_entry.universe_id))))
+          OR (l.target_entry_id=$2 AND (s.scope_kind,s.universe_id) IS NOT DISTINCT FROM (current_entry.scope_kind,current_entry.universe_id)))
      ORDER BY l.created_at DESC`, [req.user.id, req.params.id],
   );
+  res.json(result.rows);
+}));
+
+app.get('/api/characters/:id/links', asyncRoute(async (req,res)=>{
+  const character=await pool.query('SELECT id,scope_kind,universe_id FROM characters WHERE id=$1 AND owner_id=$2',[req.params.id,req.user.id]);
+  if(!character.rowCount)return res.status(404).json({error:'Personaje no encontrado.'});
+  const result=await pool.query(`SELECT l.*,e.name AS source_entry_name,e.kind AS source_entry_kind
+    FROM entry_links l JOIN archive_entries e ON e.id=l.source_entry_id AND e.owner_id=l.owner_id
+    WHERE l.owner_id=$1 AND l.target_character_id=$2
+      AND (e.scope_kind,e.universe_id) IS NOT DISTINCT FROM ($3::text,$4::int)
+    ORDER BY l.created_at DESC`,[req.user.id,req.params.id,character.rows[0].scope_kind,character.rows[0].universe_id]);
+  res.json(result.rows);
+}));
+
+app.get('/api/entries/:id/ability-users', asyncRoute(async (req,res)=>{
+  const entry=await pool.query('SELECT id,kind,scope_kind,universe_id FROM archive_entries WHERE id=$1 AND owner_id=$2',[req.params.id,req.user.id]);
+  if(!entry.rowCount)return res.status(404).json({error:'Sistema o habilidad no encontrado.'});
+  const row=entry.rows[0];
+  if(!['magic','ability'].includes(row.kind))return res.status(400).json({error:'Esta ficha no es un sistema de poderes ni una habilidad.'});
+  const result=await pool.query(`SELECT c.id AS character_id,c.name AS character_name,a->>'mastery' AS mastery,
+      a->>'origin' AS origin,a->>'limitations' AS limitations,ab.name AS ability_name
+    FROM characters c
+    CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(c.details#>'{character_sheet,abilities}')='array' THEN c.details#>'{character_sheet,abilities}' ELSE '[]'::jsonb END) a
+    LEFT JOIN archive_entries ab ON ab.owner_id=c.owner_id AND ab.id::text=a->>'ability_entry_id'
+    WHERE c.owner_id=$1 AND (c.scope_kind,c.universe_id) IS NOT DISTINCT FROM ($2::text,$3::int)
+      AND (($4::text='magic' AND EXISTS (SELECT 1 FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(a->'system_entry_ids')='array' THEN a->'system_entry_ids' ELSE '[]'::jsonb END) s(value) WHERE s.value=$5::text))
+        OR ($4::text='ability' AND a->>'ability_entry_id'=$5::text))
+    ORDER BY c.name,ab.name`,[req.user.id,row.scope_kind,row.universe_id,row.kind,String(row.id)]);
   res.json(result.rows);
 }));
 

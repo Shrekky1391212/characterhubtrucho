@@ -156,6 +156,10 @@ test('real Express auth, legacy routes, and v2 routes use a disposable PGlite da
   const globalCharacter = await request('/api/characters', { method: 'POST', token: firstToken, body: { name: 'Global contact', scope_kind: 'global' } });
   const entryLink = await request(`/api/entries/${entry.data.id}/links`, { method: 'POST', token: firstToken, body: { target_type: 'character', target_id: globalCharacter.data.id, relation_type: 'located near' } });
   assert.equal(entryLink.status, 201);
+  const characterLinks = await request(`/api/characters/${globalCharacter.data.id}/links`, { token: firstToken });
+  assert.equal(characterLinks.status, 200);
+  assert.ok(characterLinks.data.some(link => link.id === entryLink.data.id && link.source_entry_name === 'North Harbor renamed'), 'a character can inspect links created from an entry ficha');
+  assert.equal((await request(`/api/characters/${globalCharacter.data.id}/links`, { token: secondToken })).status, 404, 'reverse link lookup remains owner-scoped');
   const linkedEntry = await request('/api/entries', { method: 'POST', token: firstToken, body: { kind: 'organization', name: 'Linked organization', scope_kind: 'global' } });
   const incomingEntryLink = await request(`/api/entries/${linkedEntry.data.id}/links`, { method: 'POST', token: firstToken, body: { target_type: 'entry', target_id: entry.data.id, relation_type: 'headquarters of' } });
   assert.equal(incomingEntryLink.status, 201);
@@ -224,6 +228,29 @@ test('real Express auth, legacy routes, and v2 routes use a disposable PGlite da
   const type = await request('/api/v2/content-types', { method: 'POST', token: firstToken, body: { label: 'Relic', icon: 'gem', field_schema: [{ key: 'rarity', label: 'Rarity', type: 'select', options: ['rare', 'common'] }] } });
   assert.equal(type.status, 201);
   assert.ok((await request('/api/v2/content-types', { token: firstToken })).data.some(row => row.slug === 'relic'));
+  const sharedAbility = await request('/api/entries', { method: 'POST', token: firstToken, body: { kind: 'ability', name: 'Starlight', scope_kind: 'universe', universe_id: universe.data.id } });
+  const powerSystem = await request('/api/entries', { method: 'POST', token: firstToken, body: { kind: 'magic', name: 'Astral current', scope_kind: 'universe', universe_id: universe.data.id } });
+  const abilitySheet = { character_sheet: { abilities: [{ ability_entry_id: sharedAbility.data.id, mastery: 'Practiced', system_entry_ids: [powerSystem.data.id] }] } };
+  assert.equal((await request(`/api/characters/${character.data.id}`, { method: 'PUT', token: firstToken, body: { name: 'Mira', scope_kind: 'universe', universe_id: universe.data.id, details: abilitySheet } })).status, 200);
+  const systemUsers = await request(`/api/entries/${powerSystem.data.id}/ability-users`, { token: firstToken });
+  assert.ok(systemUsers.data.some(item => item.character_id === character.data.id && item.ability_name === 'Starlight' && item.mastery === 'Practiced'), 'a system ficha can navigate back to its character users');
+  assert.equal((await request(`/api/characters/${character.data.id}`, { method: 'PUT', token: firstToken, body: { name: 'Mira', scope_kind: 'universe', universe_id: universe.data.id, details: { character_sheet: { abilities: [{ ability_entry_id: powerSystem.data.id }] } } } })).status, 400, 'a magic-system ficha cannot be used as an ability definition');
+  const globalSystem = await request('/api/entries', { method: 'POST', token: firstToken, body: { kind: 'magic', name: 'Global current', scope_kind: 'global' } });
+  const incompatibleSystem = await request(`/api/characters/${character.data.id}`, {
+    method: 'PUT', token: firstToken,
+    body: { name: 'Mira', scope_kind: 'universe', universe_id: universe.data.id,
+      details: { character_sheet: { abilities: [{ ability_entry_id: sharedAbility.data.id, system_entry_ids: [globalSystem.data.id] }] } } },
+  });
+  assert.equal(incompatibleSystem.status, 400, 'a character cannot refer to a power system from another scope');
+  assert.equal((await request(`/api/entries/${globalSystem.data.id}`, { method: 'DELETE', token: firstToken })).status, 204);
+  const otherOwnerAbility = await request('/api/entries', { method: 'POST', token: secondToken, body: { kind: 'ability', name: 'Private power', scope_kind: 'global' } });
+  assert.equal((await request(`/api/characters/${character.data.id}`, { method: 'PUT', token: firstToken, body: { name: 'Mira', scope_kind: 'universe', universe_id: universe.data.id, details: { character_sheet: { abilities: [{ ability_entry_id: otherOwnerAbility.data.id }] } } } })).status, 400, 'ability references cannot cross owners');
+  assert.equal((await request(`/api/entries/${otherOwnerAbility.data.id}`, { method: 'DELETE', token: secondToken })).status, 204);
+  assert.equal((await request(`/api/characters/${character.data.id}`, { method: 'PUT', token: firstToken, body: { name: 'Mira', scope_kind: 'global' } })).status, 400, 'moving a character cannot strand its ability references in another scope');
+  const organization = await request('/api/entries', { method: 'POST', token: firstToken, body: { kind: 'group', name: 'Synthetic Order', scope_kind: 'universe', universe_id: universe.data.id } });
+  const division = await request('/api/entries', { method: 'POST', token: firstToken, body: { kind: 'group', name: 'Northern Division', scope_kind: 'universe', universe_id: universe.data.id, parent_id: organization.data.id } });
+  const cyclicHierarchy = await request(`/api/entries/${organization.data.id}`, { method: 'PUT', token: firstToken, body: { kind: 'group', name: 'Synthetic Order', scope_kind: 'universe', universe_id: universe.data.id, parent_id: division.data.id } });
+  assert.equal(cyclicHierarchy.status, 400, 'organization hierarchy cannot be moved into its own descendant');
 
   const registry = await db.query(`SELECT id FROM content_items
     WHERE owner_id=$1 AND source_kind='character' AND source_id=$2`, [first.data.user.id, character.data.id]);
