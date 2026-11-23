@@ -31,7 +31,9 @@ npm.cmd --prefix server run migrate:sqlite
 
 El importador no modifica SQLite y se detiene si encuentra registros en las tablas destino. Importá antes de crear la primera cuenta y definí `INITIAL_OWNER_EMAIL` en Render: solo el primer registro con ese email puede reclamar las filas antiguas. Verificá los conteos y la cuenta antes de quitar copias. No ejecutes el importador durante cada despliegue.
 
-## GitHub Pages
+## Frontend estático
+
+La configuración vigente para Cloudflare Pages (build, `VITE_API_URL` y CORS) está en `DEPLOY.md`; si todavía usás GitHub Pages, conservá esa publicación hasta configurar Cloudflare.
 
 Configurá la variable de Actions `VITE_API_URL` con el origen de Render, sin `/api` ni barra final, como `https://oc-archive-api.onrender.com`, y volvé a ejecutar el workflow. Pages solo entrega los archivos React; no hospeda Express ni PostgreSQL.
 

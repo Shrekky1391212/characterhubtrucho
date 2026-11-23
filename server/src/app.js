@@ -1,15 +1,25 @@
 import express from 'express';
 import cors from 'cors';
-import { randomBytes, createHash, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto';
+import { randomBytes, randomUUID, createHash, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { z } from 'zod';
-import { initializeDatabase, pool } from './db.js';
+import { initializeDatabase, pool as defaultPool } from './db.js';
+import { canReparentNode, normalizeContentScope, sameContentScope } from './world-structure.js';
+import { createPhase2Router } from './phase2-router.js';
+import { validateLocationLinkReferences } from './character-location-links.js';
 
+export function createApp({ databasePool = defaultPool } = {}) {
+const pool = databasePool;
 const app = express();
 const scrypt = promisify(scryptCallback);
 const localOrigins = ['http://127.0.0.1:5173', 'http://localhost:5173', 'https://shrekky1391212.github.io'];
 const allowedOrigins = (process.env.CORS_ORIGINS || localOrigins.join(','))
   .split(',').map(origin => origin.trim()).filter(Boolean);
+if (process.env.NODE_ENV === 'production' && !process.env.CORS_ORIGINS) {
+  console.warn('CORS_ORIGINS is unset; Cloudflare Pages origins will not be allowed.');
+}
 
 app.use(cors({
   origin(origin, callback) {
@@ -17,7 +27,7 @@ app.use(cors({
     return callback(new Error('Origin is not allowed by CORS.'));
   },
   allowedHeaders: ['Content-Type', 'Authorization'],
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
 }));
 app.use(express.json({ limit: '1mb' }));
 
@@ -53,6 +63,8 @@ const universeSchema = z.object({
 });
 const characterSchema = z.object({
   universe_id: z.coerce.number().int().positive().nullable().optional(),
+  scope_kind: z.enum(['universe', 'pending', 'global']).optional(),
+  universe_node_id: z.coerce.number().int().positive().nullable().optional(),
   name: z.string().trim().min(1).max(120),
   alias: z.string().max(240).optional().default(''),
   pronouns: z.string().max(80).optional().default(''),
@@ -66,7 +78,7 @@ const characterSchema = z.object({
   tags: z.string().max(500).optional().default(''),
   description: z.string().max(3000).optional().default(''),
   biography: z.string().max(20000).optional().default(''),
-  details: z.record(z.string(), z.unknown()).optional().default({}),
+  details: z.record(z.string(), z.unknown()).optional(),
 });
 const themeSchema = z.object({
   prompt: z.string().max(1000).optional().default(''),
@@ -87,9 +99,18 @@ const entrySchema = z.object({
   name: z.string().trim().min(1).max(180),
   description: z.string().max(20000).optional().default(''),
   universe_id: z.coerce.number().int().positive().nullable().optional(),
+  scope_kind: z.enum(['universe', 'pending', 'global']).optional(),
+  universe_node_id: z.coerce.number().int().positive().nullable().optional(),
   parent_id: z.coerce.number().int().positive().nullable().optional(),
   tags: z.array(z.string().trim().min(1).max(60)).max(40).optional().default([]),
-  data: z.record(z.string(), z.unknown()).optional().default({}),
+  data: z.record(z.string(), z.unknown()).optional(),
+});
+const nodeSchema = z.object({
+  name: z.string().trim().min(1).max(120),
+  node_type: z.string().trim().min(1).max(48).regex(/^[a-zA-Z0-9_-]+$/).optional().default('section'),
+  description: z.string().max(4000).optional().default(''),
+  parent_id: z.coerce.number().int().positive().nullable().optional().default(null),
+  sort_order: z.coerce.number().int().min(-100000).max(100000).optional().default(0),
 });
 const relationshipSchema = z.object({
   source_character_id: z.coerce.number().int().positive(),
@@ -99,6 +120,20 @@ const relationshipSchema = z.object({
   description: z.string().max(4000).optional().default(''),
   dynamics: z.string().max(4000).optional().default(''),
   details: z.record(z.string(), z.unknown()).optional().default({}),
+});
+const relationshipNetworkSchema = z.object({
+  source_character_id: z.coerce.number().int().positive(),
+  target_character_ids: z.array(z.coerce.number().int().positive()).min(1).max(40),
+  relation_type: z.string().trim().min(1).max(80), reverse_relation_type: z.string().trim().min(1).max(80).optional(),
+  reciprocal: z.boolean().optional().default(false), status: z.string().max(80).optional().default(''),
+  description: z.string().max(4000).optional().default(''), dynamics: z.string().max(4000).optional().default(''),
+  start_date: z.string().max(120).optional().default(''), end_date: z.string().max(120).optional().default(''),
+  history: z.string().max(10000).optional().default(''), notes: z.string().max(10000).optional().default(''),
+});
+const relationshipPatchSchema = z.object({
+  relation_type: z.string().trim().min(1).max(80).optional(), status: z.string().max(80).optional(),
+  description: z.string().max(4000).optional(), dynamics: z.string().max(4000).optional(),
+  details: z.record(z.string(), z.unknown()).optional(),
 });
 const contentTypeSchema = z.object({ label: z.string().trim().min(1).max(60), icon: z.string().max(50).optional().default('archive') });
 const mediaSchema = z.object({
@@ -210,6 +245,9 @@ const authenticate = asyncRoute(async (req, res, next) => {
 });
 
 app.use(authenticate);
+// The v2 router is mounted behind the existing session middleware. It never
+// installs or migrates the additive Phase 2 schema during Express startup.
+app.use('/api/v2', createPhase2Router(pool));
 
 app.get('/api/auth/me', (req, res) => res.json({ user: normalizeUser(req.user) }));
 
@@ -268,6 +306,53 @@ async function ownedEntry(ownerId, entryId) {
   return result.rowCount > 0;
 }
 
+async function entryParentWouldCycle(ownerId, entryId, parentId) {
+  if (Number(entryId) === Number(parentId)) return true;
+  const result=await pool.query(`WITH RECURSIVE descendants(id) AS (
+    SELECT id FROM archive_entries WHERE owner_id=$1 AND id=$2
+    UNION
+    SELECT child.id FROM archive_entries child JOIN descendants parent ON child.parent_id=parent.id WHERE child.owner_id=$1
+  ) SELECT EXISTS(SELECT 1 FROM descendants WHERE id=$3) AS creates_cycle`,[ownerId,entryId,parentId]);
+  return result.rows[0]?.creates_cycle===true;
+}
+
+async function ownedNode(ownerId, universeId, nodeId) {
+  if (!nodeId) return true;
+  const result = await pool.query('SELECT id FROM universe_nodes WHERE id=$1 AND owner_id=$2 AND universe_id=$3', [nodeId, ownerId, universeId]);
+  return result.rowCount > 0;
+}
+
+async function entityScope(ownerId, entityType, entityId) {
+  const table = entityType === 'character' ? 'characters' : 'archive_entries';
+  const result = await pool.query(`SELECT scope_kind, universe_id FROM ${table} WHERE id=$1 AND owner_id=$2`, [entityId, ownerId]);
+  return result.rows[0] || null;
+}
+
+function addScopeFilters(req, ownerId, tableAlias, values, filters) {
+  const add = (sql, value) => { values.push(value); filters.push(sql.replace('?', `$${values.length}`)); };
+  const scope = String(req.query.scope || 'all');
+  if (!['all', 'pending', 'global', 'universe'].includes(scope)) return { error: 'Alcance no válido.' };
+  if (scope === 'pending' || scope === 'global') add(`${tableAlias}.scope_kind = ?`, scope);
+  const universeValue = req.query.universe_id || req.query.universe;
+  if (scope === 'universe' || universeValue) {
+    const universeId = Number(universeValue);
+    if (!Number.isInteger(universeId) || universeId <= 0) return { error: 'Seleccioná un universo válido.' };
+    add(`${tableAlias}.universe_id = ?`, universeId);
+  }
+  if (req.query.node_id) {
+    const nodeId = Number(req.query.node_id);
+    const universeId = Number(universeValue);
+    if (!Number.isInteger(nodeId) || nodeId <= 0 || !Number.isInteger(universeId) || !universeId) return { error: 'El nivel requiere un universo válido.' };
+    values.push(ownerId, universeId, nodeId);
+    const ownerParam = values.length - 2, universeParam = values.length - 1, nodeParam = values.length;
+    filters.push(`${tableAlias}.universe_node_id IN (WITH RECURSIVE descendants(id) AS (
+      SELECT id FROM universe_nodes WHERE owner_id=$${ownerParam} AND universe_id=$${universeParam} AND id=$${nodeParam}
+      UNION ALL SELECT n.id FROM universe_nodes n JOIN descendants d ON n.parent_id=d.id WHERE n.owner_id=$${ownerParam} AND n.universe_id=$${universeParam}
+    ) SELECT id FROM descendants)`);
+  }
+  return {};
+}
+
 const universeSelect = 'SELECT * FROM universes WHERE owner_id = $1 ORDER BY updated_at DESC, id DESC';
 app.get('/api/universes', asyncRoute(async (req, res) => {
   const result = await pool.query(universeSelect, [req.user.id]);
@@ -301,9 +386,87 @@ app.put('/api/universes/:id', asyncRoute(async (req, res) => {
 }));
 
 app.delete('/api/universes/:id', asyncRoute(async (req, res) => {
-  const result = await pool.query('DELETE FROM universes WHERE id=$1 AND owner_id=$2 RETURNING id', [req.params.id, req.user.id]);
-  if (!result.rowCount) return res.status(404).json({ error: 'Universo no encontrado.' });
-  res.status(204).end();
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const owned = await client.query('SELECT id FROM universes WHERE id=$1 AND owner_id=$2 FOR UPDATE', [req.params.id, req.user.id]);
+    if (!owned.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Universo no encontrado.' }); }
+    const phase2 = await client.query("SELECT to_regclass('public.content_groups') IS NOT NULL AS installed");
+    if (phase2.rows[0].installed) {
+      const groups = await client.query(`WITH RECURSIVE tree(id,parent_group_id,depth) AS (
+        SELECT id,parent_group_id,0 FROM content_groups WHERE owner_id=$1 AND space_type='universe' AND universe_id=$2 AND parent_group_id IS NULL
+        UNION ALL SELECT child.id,child.parent_group_id,parent.depth+1 FROM content_groups child JOIN tree parent
+          ON child.parent_group_id=parent.id WHERE child.owner_id=$1
+      ) SELECT id FROM tree ORDER BY depth DESC,id`, [req.user.id, req.params.id]);
+      for (const group of groups.rows) await client.query('DELETE FROM content_groups WHERE owner_id=$1 AND id=$2', [req.user.id, group.id]);
+    }
+    await client.query("UPDATE characters SET scope_kind='pending', universe_id=NULL, universe_node_id=NULL, updated_at=CURRENT_TIMESTAMP WHERE universe_id=$1 AND owner_id=$2", [req.params.id, req.user.id]);
+    await client.query("UPDATE archive_entries SET scope_kind='pending', universe_id=NULL, universe_node_id=NULL, updated_at=CURRENT_TIMESTAMP WHERE universe_id=$1 AND owner_id=$2", [req.params.id, req.user.id]);
+    await client.query('DELETE FROM universes WHERE id=$1 AND owner_id=$2', [req.params.id, req.user.id]);
+    await client.query('COMMIT');
+    res.status(204).end();
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally { client.release(); }
+}));
+
+app.get('/api/universes/:id/nodes', asyncRoute(async (req, res) => {
+  const universe = await pool.query('SELECT id FROM universes WHERE id=$1 AND owner_id=$2', [req.params.id, req.user.id]);
+  if (!universe.rowCount) return res.status(404).json({ error: 'Universo no encontrado.' });
+  const result = await pool.query('SELECT * FROM universe_nodes WHERE owner_id=$1 AND universe_id=$2 ORDER BY parent_id NULLS FIRST, sort_order, name, id', [req.user.id, req.params.id]);
+  res.json(result.rows);
+}));
+
+app.post('/api/universes/:id/nodes', asyncRoute(async (req, res) => {
+  const parsed = nodeSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Revisá el nivel.' });
+  const universe = await pool.query('SELECT id FROM universes WHERE id=$1 AND owner_id=$2', [req.params.id, req.user.id]);
+  if (!universe.rowCount) return res.status(404).json({ error: 'Universo no encontrado.' });
+  const d = parsed.data;
+  if (d.parent_id && !(await ownedNode(req.user.id, req.params.id, d.parent_id))) return res.status(400).json({ error: 'El nivel superior debe estar en este universo.' });
+  const result = await pool.query(
+    `INSERT INTO universe_nodes (owner_id, universe_id, parent_id, name, node_type, description, sort_order)
+     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+    [req.user.id, req.params.id, d.parent_id, d.name, d.node_type, d.description, d.sort_order],
+  );
+  res.status(201).json(result.rows[0]);
+}));
+
+app.put('/api/nodes/:id', asyncRoute(async (req, res) => {
+  const parsed = nodeSchema.extend({ universe_id: z.coerce.number().int().positive() }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Revisá el nivel.' });
+  const d = parsed.data;
+  const current = await pool.query('SELECT * FROM universe_nodes WHERE id=$1 AND owner_id=$2', [req.params.id, req.user.id]);
+  if (!current.rowCount) return res.status(404).json({ error: 'Nivel no encontrado.' });
+  if (Number(current.rows[0].universe_id) !== d.universe_id) return res.status(400).json({ error: 'Un nivel no se puede mover entre universos.' });
+  const allNodes = await pool.query('SELECT id, universe_id, parent_id FROM universe_nodes WHERE owner_id=$1 AND universe_id=$2', [req.user.id, d.universe_id]);
+  if (!canReparentNode(allNodes.rows, req.params.id, d.parent_id, d.universe_id)) return res.status(400).json({ error: 'El nuevo nivel superior no es válido o crearía un ciclo.' });
+  const result = await pool.query(
+    `UPDATE universe_nodes SET parent_id=$1, name=$2, node_type=$3, description=$4, sort_order=$5, updated_at=CURRENT_TIMESTAMP
+     WHERE id=$6 AND owner_id=$7 AND universe_id=$8 RETURNING *`,
+    [d.parent_id, d.name, d.node_type, d.description, d.sort_order, req.params.id, req.user.id, d.universe_id],
+  );
+  res.json(result.rows[0]);
+}));
+
+app.delete('/api/nodes/:id', asyncRoute(async (req, res) => {
+  const node = await pool.query('SELECT * FROM universe_nodes WHERE id=$1 AND owner_id=$2', [req.params.id, req.user.id]);
+  if (!node.rowCount) return res.status(404).json({ error: 'Nivel no encontrado.' });
+  const child = await pool.query('SELECT 1 FROM universe_nodes WHERE owner_id=$1 AND universe_id=$2 AND parent_id=$3 LIMIT 1', [req.user.id, node.rows[0].universe_id, req.params.id]);
+  if (child.rowCount) return res.status(409).json({ error: 'Mové o eliminá primero los niveles que dependen de este.' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('UPDATE characters SET universe_node_id=NULL WHERE owner_id=$1 AND universe_node_id=$2', [req.user.id, req.params.id]);
+    await client.query('UPDATE archive_entries SET universe_node_id=NULL WHERE owner_id=$1 AND universe_node_id=$2', [req.user.id, req.params.id]);
+    await client.query('DELETE FROM universe_nodes WHERE id=$1 AND owner_id=$2', [req.params.id, req.user.id]);
+    await client.query('COMMIT');
+    res.status(204).end();
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally { client.release(); }
 }));
 
 app.get('/api/universes/:id/theme', asyncRoute(async (req, res) => {
@@ -334,17 +497,24 @@ app.put('/api/universes/:id/theme', asyncRoute(async (req, res) => {
 
 const characterSelect = `SELECT c.*, u.name AS universe_name, u.color AS universe_color
   FROM characters c LEFT JOIN universes u ON u.id = c.universe_id AND u.owner_id = c.owner_id`;
+app.get('/api/characters/:id', asyncRoute(async (req, res) => {
+  const result = await pool.query(`${characterSelect} WHERE c.id=$1 AND c.owner_id=$2`, [req.params.id, req.user.id]);
+  if (!result.rowCount) return res.status(404).json({ error: 'Personaje no encontrado.' });
+  res.json(result.rows[0]);
+}));
 app.get('/api/characters', asyncRoute(async (req, res) => {
   const { q = '', universe = '', gender = '', species = '', status = '', origin = '', residence = '', tag = '' } = req.query;
   const values = [req.user.id];
   const filters = ['c.owner_id = $1'];
   const add = (sql, value) => { values.push(value); filters.push(sql.replace('?', `$${values.length}`)); };
+  const scopeResult = addScopeFilters(req, req.user.id, 'c', values, filters);
+  if (scopeResult.error) return res.status(400).json({ error: scopeResult.error });
   if (q) {
     const start = values.length + 1, term = `%${q}%`;
     values.push(term, term, term, term, term);
     filters.push(`(c.name ILIKE $${start} OR c.alias ILIKE $${start + 1} OR c.description ILIKE $${start + 2} OR c.biography ILIKE $${start + 3} OR c.tags ILIKE $${start + 4})`);
   }
-  if (universe) {
+  if (universe && !req.query.universe_id) {
     const id = Number(universe);
     if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'El filtro de universo no es válido.' });
     add('c.universe_id = ?', id);
@@ -359,14 +529,19 @@ app.post('/api/characters', asyncRoute(async (req, res) => {
   const parsed = characterSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Revisá los campos del personaje.', details: z.flattenError(parsed.error) });
   const d = parsed.data;
-  if (!(await ownedUniverse(req.user.id, d.universe_id))) return res.status(400).json({ error: 'El universo no existe en tu archivo.' });
+  const scope = normalizeContentScope(d);
+  if (!scope) return res.status(400).json({ error: 'Elegí un universo, o marcá el elemento como pendiente o global.' });
+  if (!(await ownedUniverse(req.user.id, scope.universe_id))) return res.status(400).json({ error: 'El universo no existe en tu archivo.' });
+  if (!(await ownedNode(req.user.id, scope.universe_id, scope.universe_node_id))) return res.status(400).json({ error: 'El nivel no pertenece al universo elegido.' });
+  const locationError = await validateLocationLinkReferences(pool, req.user.id, scope, d.details?.location_links);
+  if (locationError) return res.status(400).json({ error: locationError, details: { fieldErrors: { 'details.location_links': [locationError] } } });
   const result = await pool.query(
     `WITH inserted AS (
-       INSERT INTO characters (owner_id, universe_id, name, alias, pronouns, gender, species, origin, residence, occupation, status, powers, tags, description, biography, details)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *
+       INSERT INTO characters (owner_id, scope_kind, universe_id, universe_node_id, name, alias, pronouns, gender, species, origin, residence, occupation, status, powers, tags, description, biography, details)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *
      ) SELECT inserted.*, u.name AS universe_name, u.color AS universe_color FROM inserted
        LEFT JOIN universes u ON u.id=inserted.universe_id AND u.owner_id=inserted.owner_id`,
-    [req.user.id, d.universe_id || null, d.name, d.alias, d.pronouns, d.gender, d.species, d.origin, d.residence, d.occupation, d.status, d.powers, d.tags, d.description, d.biography, d.details],
+     [req.user.id, scope.scope_kind, scope.universe_id, scope.universe_node_id, d.name, d.alias, d.pronouns, d.gender, d.species, d.origin, d.residence, d.occupation, d.status, d.powers, d.tags, d.description, d.biography, d.details ?? {}],
   );
   res.status(201).json(result.rows[0]);
 }));
@@ -375,15 +550,20 @@ app.put('/api/characters/:id', asyncRoute(async (req, res) => {
   const parsed = characterSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Revisá los campos del personaje.', details: z.flattenError(parsed.error) });
   const d = parsed.data;
-  if (!(await ownedUniverse(req.user.id, d.universe_id))) return res.status(400).json({ error: 'El universo no existe en tu archivo.' });
+  const scope = normalizeContentScope(d);
+  if (!scope) return res.status(400).json({ error: 'Elegí un universo, o marcá el elemento como pendiente o global.' });
+  if (!(await ownedUniverse(req.user.id, scope.universe_id))) return res.status(400).json({ error: 'El universo no existe en tu archivo.' });
+  if (!(await ownedNode(req.user.id, scope.universe_id, scope.universe_node_id))) return res.status(400).json({ error: 'El nivel no pertenece al universo elegido.' });
+  const locationError = await validateLocationLinkReferences(pool, req.user.id, scope, d.details?.location_links);
+  if (locationError) return res.status(400).json({ error: locationError, details: { fieldErrors: { 'details.location_links': [locationError] } } });
   const result = await pool.query(
     `WITH updated AS (
-       UPDATE characters SET universe_id=$1, name=$2, alias=$3, pronouns=$4, gender=$5, species=$6, origin=$7,
-         residence=$8, occupation=$9, status=$10, powers=$11, tags=$12, description=$13, biography=$14,
-         details=$15, updated_at=CURRENT_TIMESTAMP WHERE id=$16 AND owner_id=$17 RETURNING *
+       UPDATE characters SET scope_kind=$1, universe_id=$2, universe_node_id=$3, name=$4, alias=$5, pronouns=$6, gender=$7, species=$8, origin=$9,
+         residence=$10, occupation=$11, status=$12, powers=$13, tags=$14, description=$15, biography=$16,
+          details=COALESCE($17::jsonb,details), updated_at=CURRENT_TIMESTAMP WHERE id=$18 AND owner_id=$19 RETURNING *
      ) SELECT updated.*, u.name AS universe_name, u.color AS universe_color FROM updated
        LEFT JOIN universes u ON u.id=updated.universe_id AND u.owner_id=updated.owner_id`,
-    [d.universe_id || null, d.name, d.alias, d.pronouns, d.gender, d.species, d.origin, d.residence, d.occupation, d.status, d.powers, d.tags, d.description, d.biography, d.details, req.params.id, req.user.id],
+     [scope.scope_kind, scope.universe_id, scope.universe_node_id, d.name, d.alias, d.pronouns, d.gender, d.species, d.origin, d.residence, d.occupation, d.status, d.powers, d.tags, d.description, d.biography, d.details ?? null, req.params.id, req.user.id],
   );
   if (!result.rowCount) return res.status(404).json({ error: 'Personaje no encontrado.' });
   res.json(result.rows[0]);
@@ -399,8 +579,10 @@ app.get('/api/entries', asyncRoute(async (req, res) => {
   const values = [req.user.id];
   const filters = ['e.owner_id=$1'];
   const add = (sql, value) => { values.push(value); filters.push(sql.replace('?', `$${values.length}`)); };
+  const scopeResult = addScopeFilters(req, req.user.id, 'e', values, filters);
+  if (scopeResult.error) return res.status(400).json({ error: scopeResult.error });
   if (req.query.kind) add('e.kind = ?', String(req.query.kind));
-  if (req.query.universe) add('e.universe_id = ?', Number(req.query.universe));
+  if (req.query.universe && !req.query.universe_id) add('e.universe_id = ?', Number(req.query.universe));
   if (req.query.parent) add('e.parent_id = ?', Number(req.query.parent));
   if (req.query.q) {
     values.push(`%${req.query.q}%`);
@@ -412,6 +594,7 @@ app.get('/api/entries', asyncRoute(async (req, res) => {
      FROM archive_entries e
      LEFT JOIN universes u ON u.id=e.universe_id AND u.owner_id=e.owner_id
      LEFT JOIN archive_entries p ON p.id=e.parent_id AND p.owner_id=e.owner_id
+       AND (p.scope_kind,p.universe_id) IS NOT DISTINCT FROM (e.scope_kind,e.universe_id)
      WHERE ${filters.join(' AND ')} ORDER BY e.updated_at DESC, e.id DESC`, values,
   );
   res.json(result.rows);
@@ -427,11 +610,18 @@ app.post('/api/entries', asyncRoute(async (req, res) => {
   const parsed = entrySchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Revisá los datos del elemento.', details: z.flattenError(parsed.error) });
   const d = parsed.data;
-  if (!(await ownedUniverse(req.user.id, d.universe_id)) || !(await ownedEntry(req.user.id, d.parent_id))) return res.status(400).json({ error: 'El universo o elemento superior no pertenece a tu archivo.' });
+  const scope = normalizeContentScope(d);
+  if (!scope) return res.status(400).json({ error: 'Elegí un universo, o marcá el elemento como pendiente o global.' });
+  if (!(await ownedUniverse(req.user.id, scope.universe_id)) || !(await ownedNode(req.user.id, scope.universe_id, scope.universe_node_id)) || !(await ownedEntry(req.user.id, d.parent_id))) return res.status(400).json({ error: 'El universo, nivel o elemento superior no pertenece a tu archivo.' });
+  if (d.parent_id) {
+    const parent = await entityScope(req.user.id, 'entry', d.parent_id);
+    if (!sameContentScope(parent, scope)) return res.status(400).json({ error: 'El elemento superior debe tener el mismo alcance.' });
+    if (await entryParentWouldCycle(req.user.id,req.params.id,d.parent_id)) return res.status(400).json({error:'La jerarquía produciría un ciclo.'});
+  }
   const result = await pool.query(
-    `INSERT INTO archive_entries (owner_id, universe_id, parent_id, kind, name, description, tags, data)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-    [req.user.id, d.universe_id || null, d.parent_id || null, d.kind, d.name, d.description, d.tags, d.data],
+    `INSERT INTO archive_entries (owner_id, scope_kind, universe_id, universe_node_id, parent_id, kind, name, description, tags, data)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+     [req.user.id, scope.scope_kind, scope.universe_id, scope.universe_node_id, d.parent_id || null, d.kind, d.name, d.description, d.tags, d.data ?? {}],
   );
   res.status(201).json(result.rows[0]);
 }));
@@ -440,11 +630,17 @@ app.put('/api/entries/:id', asyncRoute(async (req, res) => {
   const parsed = entrySchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Revisá los datos del elemento.', details: z.flattenError(parsed.error) });
   const d = parsed.data;
-  if (!(await ownedUniverse(req.user.id, d.universe_id)) || !(await ownedEntry(req.user.id, d.parent_id))) return res.status(400).json({ error: 'El universo o elemento superior no pertenece a tu archivo.' });
+  const scope = normalizeContentScope(d);
+  if (!scope) return res.status(400).json({ error: 'Elegí un universo, o marcá el elemento como pendiente o global.' });
+  if (!(await ownedUniverse(req.user.id, scope.universe_id)) || !(await ownedNode(req.user.id, scope.universe_id, scope.universe_node_id)) || !(await ownedEntry(req.user.id, d.parent_id))) return res.status(400).json({ error: 'El universo, nivel o elemento superior no pertenece a tu archivo.' });
+  if (d.parent_id) {
+    const parent = await entityScope(req.user.id, 'entry', d.parent_id);
+    if (!sameContentScope(parent, scope)) return res.status(400).json({ error: 'El elemento superior debe tener el mismo alcance.' });
+  }
   const result = await pool.query(
-    `UPDATE archive_entries SET universe_id=$1, parent_id=$2, kind=$3, name=$4, description=$5, tags=$6, data=$7, updated_at=CURRENT_TIMESTAMP
-     WHERE id=$8 AND owner_id=$9 RETURNING *`,
-    [d.universe_id || null, d.parent_id || null, d.kind, d.name, d.description, d.tags, d.data, req.params.id, req.user.id],
+    `UPDATE archive_entries SET scope_kind=$1, universe_id=$2, universe_node_id=$3, parent_id=$4, kind=$5, name=$6, description=$7, tags=$8, data=COALESCE($9::jsonb,data), updated_at=CURRENT_TIMESTAMP
+     WHERE id=$10 AND owner_id=$11 RETURNING *`,
+    [scope.scope_kind, scope.universe_id, scope.universe_node_id, d.parent_id || null, d.kind, d.name, d.description, d.tags, d.data ?? null, req.params.id, req.user.id],
   );
   if (!result.rowCount) return res.status(404).json({ error: 'Elemento no encontrado.' });
   res.json(result.rows[0]);
@@ -460,11 +656,20 @@ app.get('/api/entries/:id/links', asyncRoute(async (req, res) => {
   const owned = await ownedEntry(req.user.id, req.params.id);
   if (!owned) return res.status(404).json({ error: 'Elemento no encontrado.' });
   const result = await pool.query(
-    `SELECT l.*, t.name AS target_entry_name, c.name AS target_character_name
+    `SELECT l.*,
+       CASE WHEN l.source_entry_id=$2 THEN t.name ELSE s.name END AS target_entry_name,
+       CASE WHEN l.source_entry_id=$2 THEN c.name ELSE NULL END AS target_character_name,
+       (l.source_entry_id<>$2) AS is_incoming
      FROM entry_links l
+      JOIN archive_entries s ON s.id=l.source_entry_id AND s.owner_id=l.owner_id
      LEFT JOIN archive_entries t ON t.id=l.target_entry_id AND t.owner_id=l.owner_id
      LEFT JOIN characters c ON c.id=l.target_character_id AND c.owner_id=l.owner_id
-     WHERE l.owner_id=$1 AND l.source_entry_id=$2 ORDER BY l.created_at DESC`, [req.user.id, req.params.id],
+      WHERE l.owner_id=$1 AND (l.source_entry_id=$2 OR l.target_entry_id=$2)
+        AND ((l.target_entry_id IS NOT NULL AND (t.scope_kind,t.universe_id) IS NOT DISTINCT FROM (s.scope_kind,s.universe_id))
+          OR (l.target_character_id IS NOT NULL AND (c.scope_kind,c.universe_id) IS NOT DISTINCT FROM (s.scope_kind,s.universe_id)))
+        AND ((l.source_entry_id=$2 AND ((t.id IS NOT NULL AND (t.scope_kind,t.universe_id) IS NOT DISTINCT FROM (s.scope_kind,s.universe_id)) OR (c.id IS NOT NULL AND (c.scope_kind,c.universe_id) IS NOT DISTINCT FROM (s.scope_kind,s.universe_id))))
+          OR (l.target_entry_id=$2 AND (s.scope_kind,s.universe_id) IS NOT DISTINCT FROM ((SELECT e.scope_kind,e.universe_id FROM archive_entries e WHERE e.id=$2 AND e.owner_id=$1))))
+     ORDER BY l.created_at DESC`, [req.user.id, req.params.id],
   );
   res.json(result.rows);
 }));
@@ -474,16 +679,31 @@ app.post('/api/entries/:id/links', asyncRoute(async (req, res) => {
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Revisá la relación.' });
   if (!(await ownedEntry(req.user.id, req.params.id))) return res.status(404).json({ error: 'Elemento no encontrado.' });
+  const sourceScope = await entityScope(req.user.id, 'entry', req.params.id);
   const target = parsed.data.target_type === 'entry'
     ? await ownedEntry(req.user.id, parsed.data.target_id)
     : (await pool.query('SELECT id FROM characters WHERE id=$1 AND owner_id=$2', [parsed.data.target_id, req.user.id])).rowCount > 0;
   if (!target) return res.status(404).json({ error: 'El destino no existe en tu archivo.' });
+  const targetScope = await entityScope(req.user.id, parsed.data.target_type, parsed.data.target_id);
+  if (!sameContentScope(sourceScope, targetScope)) return res.status(400).json({ error: 'Los vínculos deben conectar elementos del mismo universo o del mismo alcance.' });
   const result = await pool.query(
     `INSERT INTO entry_links (owner_id, source_entry_id, target_entry_id, target_character_id, relation_type, description, details)
      VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
     [req.user.id, req.params.id, parsed.data.target_type === 'entry' ? parsed.data.target_id : null, parsed.data.target_type === 'character' ? parsed.data.target_id : null, parsed.data.relation_type, parsed.data.description, parsed.data.details],
   );
   res.status(201).json(result.rows[0]);
+}));
+
+app.put('/api/entry-links/:id', asyncRoute(async (req,res)=>{
+  const schema=z.object({relation_type:z.string().trim().min(1).max(80).optional(),description:z.string().max(3000).optional(),details:z.record(z.string(),z.unknown()).optional()});
+  const parsed=schema.safeParse(req.body);
+  if(!parsed.success)return res.status(400).json({error:'Revisá los cambios del vínculo.',details:z.flattenError(parsed.error)});
+  const existing=await pool.query('SELECT * FROM entry_links WHERE id=$1 AND owner_id=$2',[req.params.id,req.user.id]);
+  if(!existing.rowCount)return res.status(404).json({error:'Vínculo no encontrado.'});
+  const d=parsed.data;
+  const result=await pool.query(`UPDATE entry_links SET relation_type=COALESCE($1,relation_type),description=COALESCE($2,description),details=COALESCE($3::jsonb,details) WHERE id=$4 AND owner_id=$5 RETURNING *`,
+    [d.relation_type??null,d.description??null,d.details?JSON.stringify({...existing.rows[0].details,...d.details}):null,req.params.id,req.user.id]);
+  res.json(result.rows[0]);
 }));
 
 app.delete('/api/entry-links/:id', asyncRoute(async (req, res) => {
@@ -499,12 +719,20 @@ app.get('/api/relationships', asyncRoute(async (req, res) => {
     values.push(Number(req.query.character_id));
     filter += ` AND (r.source_character_id=$${values.length} OR r.target_character_id=$${values.length})`;
   }
+  if (req.query.universe_id) {
+    const universeId = Number(req.query.universe_id);
+    if (!Number.isInteger(universeId) || universeId <= 0) return res.status(400).json({ error: 'Seleccioná un universo válido.' });
+    values.push(universeId);
+    filter += ` AND s.universe_id=$${values.length} AND t.universe_id=$${values.length} AND s.scope_kind='universe' AND t.scope_kind='universe'`;
+  }
   const result = await pool.query(
     `SELECT r.*, s.name AS source_name, t.name AS target_name
      FROM character_relationships r
      JOIN characters s ON s.id=r.source_character_id AND s.owner_id=r.owner_id
      JOIN characters t ON t.id=r.target_character_id AND t.owner_id=r.owner_id
-     WHERE ${filter} ORDER BY r.updated_at DESC, r.id DESC`, values,
+      WHERE ${filter}
+        AND (s.scope_kind,s.universe_id) IS NOT DISTINCT FROM (t.scope_kind,t.universe_id)
+      ORDER BY r.updated_at DESC, r.id DESC`, values,
   );
   res.json(result.rows);
 }));
@@ -515,12 +743,75 @@ app.post('/api/relationships', asyncRoute(async (req, res) => {
   const d = parsed.data;
   const characters = await pool.query('SELECT id FROM characters WHERE owner_id=$1 AND id = ANY($2::int[])', [req.user.id, [d.source_character_id, d.target_character_id]]);
   if (characters.rowCount !== 2) return res.status(404).json({ error: 'Ambos personajes deben pertenecer a tu archivo.' });
+  const scopes = await pool.query('SELECT scope_kind, universe_id FROM characters WHERE owner_id=$1 AND id = ANY($2::int[])', [req.user.id, [d.source_character_id, d.target_character_id]]);
+  if (!sameContentScope(scopes.rows[0], scopes.rows[1])) return res.status(400).json({ error: 'Las relaciones deben conectar personajes del mismo universo o del mismo alcance.' });
   const result = await pool.query(
     `INSERT INTO character_relationships (owner_id, source_character_id, target_character_id, relation_type, status, description, dynamics, details)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
     [req.user.id, d.source_character_id, d.target_character_id, d.relation_type, d.status, d.description, d.dynamics, d.details],
   );
   res.status(201).json(result.rows[0]);
+}));
+
+app.post('/api/relationships/network', asyncRoute(async (req, res) => {
+  const parsed = relationshipNetworkSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Revisá los datos de la red de relaciones.', details: z.flattenError(parsed.error) });
+  const d = parsed.data;
+  const participantIds = [...new Set([d.source_character_id, ...d.target_character_ids])];
+  if (participantIds.length < 2 || participantIds.length !== d.target_character_ids.length + 1) return res.status(400).json({ error: 'Elegí al menos dos personajes distintos; no repitas participantes.' });
+  const participants = await pool.query('SELECT id,scope_kind,universe_id FROM characters WHERE owner_id=$1 AND id=ANY($2::int[])', [req.user.id, participantIds]);
+  if (participants.rowCount !== participantIds.length) return res.status(404).json({ error: 'Todos los personajes deben pertenecer a tu archivo.' });
+  if (participants.rows.some(row => !sameContentScope(row, participants.rows[0]))) return res.status(400).json({ error: 'Las relaciones deben conectar personajes del mismo universo o del mismo ámbito.' });
+  const relationGroupId = randomUUID();
+  const details = { relation_group_id: relationGroupId, participant_ids: participantIds, start_date: d.start_date, end_date: d.end_date, history: d.history, notes: d.notes };
+  const pairs = d.target_character_ids.flatMap(targetId => [
+    { source: d.source_character_id, target: targetId, type: d.relation_type },
+    ...(d.reciprocal ? [{ source: targetId, target: d.source_character_id, type: d.reverse_relation_type || d.relation_type }] : []),
+  ]);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const rows = [];
+    for (const pair of pairs) {
+      const result = await client.query(`INSERT INTO character_relationships
+        (owner_id,source_character_id,target_character_id,relation_type,status,description,dynamics,details)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [req.user.id,pair.source,pair.target,pair.type,d.status,d.description,d.dynamics,details]);
+      rows.push(result.rows[0]);
+    }
+    await client.query('COMMIT');
+    res.status(201).json({ relation_group_id: relationGroupId, participants: participants.rows, relationships: rows });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(()=>{});
+    throw error;
+  } finally { client.release(); }
+}));
+
+app.put('/api/relationships/:id', asyncRoute(async (req, res) => {
+  const parsed = relationshipPatchSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Revisá los cambios de la relación.', details: z.flattenError(parsed.error) });
+  const d=parsed.data;
+  const current=await pool.query('SELECT * FROM character_relationships WHERE id=$1 AND owner_id=$2',[req.params.id,req.user.id]);
+  if(!current.rowCount)return res.status(404).json({error:'Relación no encontrada.'});
+  const client=await pool.connect();
+  try{
+    await client.query('BEGIN');
+    const details=d.details?JSON.stringify({...current.rows[0].details,...d.details}):null;
+    const result=await client.query(`UPDATE character_relationships SET
+      relation_type=COALESCE($1,relation_type),status=COALESCE($2,status),description=COALESCE($3,description),dynamics=COALESCE($4,dynamics),
+      details=COALESCE($5::jsonb,details),updated_at=CURRENT_TIMESTAMP WHERE id=$6 AND owner_id=$7 RETURNING *`,
+    [d.relation_type??null,d.status??null,d.description??null,d.dynamics??null,details,req.params.id,req.user.id]);
+    if(d.details?.relation_group_id)await client.query("UPDATE character_relationships SET details=details || $1::jsonb,updated_at=CURRENT_TIMESTAMP WHERE owner_id=$2 AND details->>'relation_group_id'=$3",[JSON.stringify(d.details),req.user.id,d.details.relation_group_id]);
+    await client.query('COMMIT');
+    const updated=await pool.query('SELECT * FROM character_relationships WHERE id=$1 AND owner_id=$2',[req.params.id,req.user.id]);
+    res.json(updated.rows[0]||result.rows[0]);
+  }catch(error){await client.query('ROLLBACK').catch(()=>{});throw error;}finally{client.release();}
+}));
+
+app.delete('/api/relationships/groups/:groupId', asyncRoute(async (req,res)=>{
+  const result=await pool.query("DELETE FROM character_relationships WHERE owner_id=$1 AND details->>'relation_group_id'=$2 RETURNING id",[req.user.id,req.params.groupId]);
+  if(!result.rowCount)return res.status(404).json({error:'Red de relaciones no encontrada.'});
+  res.status(204).end();
 }));
 
 app.delete('/api/relationships/:id', asyncRoute(async (req, res) => {
@@ -563,6 +854,49 @@ app.delete('/api/favorites/:entityType/:entityId', asyncRoute(async (req, res) =
   res.status(204).end();
 }));
 
+app.get('/api/library', asyncRoute(async (req, res) => {
+  const scope = String(req.query.scope || 'all');
+  if (!['all', 'pending', 'global', 'universe'].includes(scope)) return res.status(400).json({ error: 'Alcance no válido.' });
+  const values = [req.user.id];
+  const filters = [];
+  if (scope === 'pending' || scope === 'global') { values.push(scope); filters.push(`scope_kind=$${values.length}`); }
+  const universeValue = req.query.universe_id;
+  if (scope === 'universe' || universeValue) {
+    const universeId = Number(universeValue);
+    if (!Number.isInteger(universeId) || universeId <= 0 || !(await ownedUniverse(req.user.id, universeId))) return res.status(400).json({ error: 'Seleccioná un universo válido.' });
+    values.push(universeId); filters.push(`universe_id=$${values.length}`);
+  }
+  if (req.query.node_id) {
+    const nodeId = Number(req.query.node_id);
+    if (!Number.isInteger(nodeId) || nodeId <= 0 || !universeValue) return res.status(400).json({ error: 'El nivel requiere un universo válido.' });
+    values.push(req.user.id, Number(universeValue), nodeId);
+    const ownerParam = values.length - 2, universeParam = values.length - 1, nodeParam = values.length;
+    filters.push(`universe_node_id IN (WITH RECURSIVE descendants(id) AS (
+      SELECT id FROM universe_nodes WHERE owner_id=$${ownerParam} AND universe_id=$${universeParam} AND id=$${nodeParam}
+      UNION ALL SELECT n.id FROM universe_nodes n JOIN descendants d ON n.parent_id=d.id WHERE n.owner_id=$${ownerParam} AND n.universe_id=$${universeParam}
+    ) SELECT id FROM descendants)`);
+  }
+  if (req.query.q) {
+    values.push(`%${String(req.query.q).slice(0, 180)}%`);
+    filters.push(`(name ILIKE $${values.length} OR description ILIKE $${values.length})`);
+  }
+  const where = filters.length ? `AND ${filters.join(' AND ')}` : '';
+  const result = await pool.query(
+    `SELECT * FROM (
+       SELECT 'universe'::text AS entity_type, id AS entity_id, name, description, 'universe'::text AS kind,
+         'universe'::text AS scope_kind, id AS universe_id, NULL::integer AS universe_node_id, tags
+       FROM universes WHERE owner_id=$1
+       UNION ALL
+       SELECT 'character', id, name, description, 'character', scope_kind, universe_id, universe_node_id, string_to_array(tags, ',')
+       FROM characters WHERE owner_id=$1
+       UNION ALL
+       SELECT 'entry', id, name, description, kind, scope_kind, universe_id, universe_node_id, tags
+       FROM archive_entries WHERE owner_id=$1
+     ) items WHERE TRUE ${where} ORDER BY kind, name, entity_id`, values,
+  );
+  res.json(result.rows);
+}));
+
 app.get('/api/search', asyncRoute(async (req, res) => {
   const query = String(req.query.q || '').trim();
   if (!query) return res.json([]);
@@ -580,15 +914,16 @@ app.get('/api/search', asyncRoute(async (req, res) => {
 }));
 
 app.get('/api/dashboard', asyncRoute(async (req, res) => {
-  const [universes, characters, entries, recent, favorites, settings] = await Promise.all([
+  const [universes, characters, entries, pending, recent, favorites, settings] = await Promise.all([
     pool.query('SELECT COUNT(*)::int AS count FROM universes WHERE owner_id=$1', [req.user.id]),
     pool.query('SELECT COUNT(*)::int AS count FROM characters WHERE owner_id=$1', [req.user.id]),
     pool.query('SELECT COUNT(*)::int AS count FROM archive_entries WHERE owner_id=$1', [req.user.id]),
+    pool.query("SELECT (SELECT COUNT(*) FROM characters WHERE owner_id=$1 AND scope_kind='pending') + (SELECT COUNT(*) FROM archive_entries WHERE owner_id=$1 AND scope_kind='pending') AS count", [req.user.id]),
     pool.query(`SELECT id, kind, name, description, updated_at FROM archive_entries WHERE owner_id=$1 ORDER BY updated_at DESC LIMIT 6`, [req.user.id]),
     pool.query(`SELECT c.id, c.name, c.description, c.updated_at, 'character' AS kind FROM favorites f JOIN characters c ON c.id=f.character_id AND c.owner_id=f.owner_id WHERE f.owner_id=$1 ORDER BY f.created_at DESC LIMIT 6`, [req.user.id]),
     pool.query('SELECT dashboard_widgets FROM user_settings WHERE user_id=$1', [req.user.id]),
   ]);
-  res.json({ counts: { universes: universes.rows[0].count, characters: characters.rows[0].count, entries: entries.rows[0].count }, recent: recent.rows, favorites: favorites.rows, widgets: settings.rows[0]?.dashboard_widgets || ['stats', 'recent', 'favorites'] });
+  res.json({ counts: { universes: universes.rows[0].count, characters: characters.rows[0].count, entries: entries.rows[0].count, pending: Number(pending.rows[0].count) }, recent: recent.rows, favorites: favorites.rows, widgets: settings.rows[0]?.dashboard_widgets || ['stats', 'recent', 'favorites'] });
 }));
 
 app.put('/api/dashboard/widgets', asyncRoute(async (req, res) => {
@@ -642,7 +977,24 @@ app.delete('/api/content-types/:id', asyncRoute(async (req, res) => {
   if (!type.rowCount) return res.status(404).json({ error: 'Sección personalizada no encontrada.' });
   const entries = await pool.query('SELECT COUNT(*)::int AS count FROM archive_entries WHERE owner_id=$1 AND kind=$2', [req.user.id, type.rows[0].slug]);
   if (entries.rows[0].count) return res.status(409).json({ error: 'La sección todavía tiene elementos. Eliminá o mové sus elementos primero.' });
-  await pool.query('DELETE FROM content_types WHERE id=$1 AND owner_id=$2', [req.params.id, req.user.id]);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const phase2 = await client.query("SELECT to_regclass('public.content_items') IS NOT NULL AS items, to_regclass('public.content_type_configs') IS NOT NULL AS configs");
+    if (phase2.rows[0].items) {
+      const usage = await client.query('SELECT COUNT(*)::int AS count FROM content_items WHERE owner_id=$1 AND content_type_id=$2', [req.user.id, req.params.id]);
+      if (Number(usage.rows[0].count)) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'La sección todavía tiene elementos. Eliminá o mové sus elementos primero.' });
+      }
+    }
+    if (phase2.rows[0].configs) await client.query('DELETE FROM content_type_configs WHERE owner_id=$1 AND content_type_id=$2', [req.user.id, req.params.id]);
+    await client.query('DELETE FROM content_types WHERE id=$1 AND owner_id=$2', [req.params.id, req.user.id]);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally { client.release(); }
   res.status(204).end();
 }));
 
@@ -675,11 +1027,19 @@ app.use((err, _req, res, _next) => {
   console.error('API request failed:', err.message);
   if (err.code === '23505') return res.status(409).json({ error: 'Ya existe un registro con esos datos.' });
   if (err.code === '23503') return res.status(400).json({ error: 'La entidad relacionada no existe en tu archivo.' });
+  if (err.code === '23514') return res.status(409).json({ error: 'El cambio entra en conflicto con agrupaciones, tipos o scopes existentes; no se guardó ningún cambio.' });
   if (err.code === '22P02' || err.code === '22003') return res.status(400).json({ error: 'El identificador no es válido.' });
   res.status(500).json({ error: 'Ocurrió un error inesperado.' });
 });
 
-const port = Number(process.env.PORT || 3001);
-await initializeDatabase();
-const server = app.listen(port, '0.0.0.0', () => console.log(`OC Archive API listening on port ${port}`));
-for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => server.close(async () => { await pool.end(); process.exit(0); }));
+return app;
+}
+
+const isEntrypoint = process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+if (isEntrypoint) {
+  const port = Number(process.env.PORT || 3001);
+  await initializeDatabase();
+  const app = createApp();
+  const server = app.listen(port, '0.0.0.0', () => console.log(`OC Archive API listening on port ${port}`));
+  for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => server.close(async () => { await defaultPool.end(); process.exit(0); }));
+}

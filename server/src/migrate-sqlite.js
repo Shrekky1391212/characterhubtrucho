@@ -3,6 +3,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { initializeDatabase, pool } from './db.js';
+import { assertSafeSqliteImport } from './migration-safety.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const sqliteFile = resolve(process.env.SQLITE_FILE || resolve(here, '../data/archive.sqlite'));
@@ -39,11 +40,13 @@ async function migrate() {
     client = await pool.connect();
     await client.query('BEGIN');
     transactionOpen = true;
+    const accountCount = await client.query('SELECT COUNT(*)::int AS count FROM users');
     const destination = await client.query(`
       SELECT
         (SELECT COUNT(*) FROM universes) AS universes,
         (SELECT COUNT(*) FROM characters) AS characters,
         (SELECT COUNT(*) FROM universe_themes) AS themes`);
+    assertSafeSqliteImport(accountCount.rows[0].count, destination.rows[0]);
     const existing = Object.values(destination.rows[0]).reduce((sum, count) => sum + Number(count), 0);
     if (existing > 0) {
       throw new Error('The Neon destination is not empty. Migration stopped to avoid overwriting existing records. Use a fresh database or merge the data manually.');
